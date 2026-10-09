@@ -1,0 +1,184 @@
+name: Sync upstream and publish
+
+# 跟随官方 decolua/9router 自动更新，全程不占用 103/PVE 的资源：
+#   1) 定时把官方 master 快进同步到本 fork
+#   2) 发现官方 version 变化就自动打 vX.Y.Z tag
+#   3) 构建 linux/amd64 镜像，同时推 GHCR 和 Docker Hub
+#
+# 103 上的 1Panel「定时更新容器」任务靠 Docker Hub 国内加速拉取，无需任何改动。
+#
+# 刻意做成独立文件：上游 docker-publish.yml 里的 Docker Hub 推送被
+# `REPOSITORY === "decolua/9router"` 硬编码卡死，且 DOCKERHUB_IMAGE 写死在
+# 第 27 行。改那个文件的话，每次同步上游 master 都会冲突；新开文件上游没有，
+# 永远不会冲突。
+
+on:
+  schedule:
+    # 17:00 UTC == 北京时间 01:00，比 103 的 02:30 拉取任务早，留足构建时间
+    - cron: "0 17 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "上游没有新提交时也强制重新构建一次"
+        required: false
+        default: false
+        type: boolean
+
+# 串行化，避免两次构建并发时把 latest 推回旧版本
+concurrency:
+  group: sync-upstream-and-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  UPSTREAM_REPO: decolua/9router
+  DOCKERHUB_IMAGE: luckly888/9router
+
+jobs:
+  sync:
+    name: Sync upstream master
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.sync.outputs.version }}
+      tag: ${{ steps.sync.outputs.tag }}
+      build: ${{ steps.sync.outputs.build }}
+    steps:
+      - name: Check out fork master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream and tag release
+        id: sync
+        env:
+          FORCE_BUILD: ${{ inputs.force_build && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch --force upstream master --tags
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "上游 master 没有新提交"
+          else
+            git merge --ff-only upstream/master
+            git push origin master
+            echo "已快进同步上游 master"
+          fi
+
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          BUILD=false
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
+            echo "fork 上已存在 tag ${TAG}"
+            if [ "${FORCE_BUILD}" = "true" ]; then
+              BUILD=true
+              echo "force_build=true，仍然构建"
+            fi
+          else
+            git tag -a "${TAG}" -m "${TAG}"
+            git push origin "refs/tags/${TAG}"
+            echo "已创建并推送 tag ${TAG}"
+            BUILD=true
+          fi
+
+          echo "build=${BUILD}" >> "$GITHUB_OUTPUT"
+          echo "本次是否构建: ${BUILD}"
+
+  build:
+    name: Build and push images
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Resolve lowercase GHCR image name
+        id: names
+        run: |
+          set -euo pipefail
+          GHCR_IMAGE="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "ghcr=${GHCR_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "ghcr image: ${GHCR_IMAGE}"
+
+      - name: Compute image tags
+        id: tags
+        env:
+          VERSION: ${{ needs.sync.outputs.version }}
+          GHCR_IMAGE: ${{ steps.names.outputs.ghcr }}
+        run: |
+          set -euo pipefail
+          TAGS="${GHCR_IMAGE}:${VERSION}
+          ${DOCKERHUB_IMAGE}:${VERSION}"
+          # 预发布版本不动 latest，避免把 latest 推回旧版本
+          if [[ "${VERSION}" != *-* ]]; then
+            TAGS="${TAGS}
+          ${GHCR_IMAGE}:latest
+          ${DOCKERHUB_IMAGE}:latest"
+          fi
+          {
+            echo "list<<EOF"
+            printf '%s\n' "${TAGS}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          printf '本次推送的 tag:\n%s\n' "${TAGS}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push linux/amd64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: |
+            APP_VERSION=${{ needs.sync.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        env:
+          VERSION: ${{ needs.sync.outputs.version }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          GHCR_IMAGE: ${{ steps.names.outputs.ghcr }}
+        run: |
+          {
+            echo "### 构建完成"
+            echo ""
+            echo "- 版本: \`${TAG}\`"
+            echo "- GHCR: \`${GHCR_IMAGE}:${VERSION}\`"
+            echo "- Docker Hub: \`${DOCKERHUB_IMAGE}:${VERSION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
