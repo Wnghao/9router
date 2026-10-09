@@ -14,8 +14,10 @@ name: Sync upstream and publish
 
 on:
   schedule:
-    # 17:00 UTC == 北京时间 01:00，比 103 的 02:30 拉取任务早，留足构建时间
-    - cron: "0 17 * * *"
+    # 每小时整点（UTC）检查一次官方 master。
+    # 只是"检查"：没有新提交就几秒结束，不会重复构建。
+    # 103 侧的 1Panel 任务在每小时第 30 分拉取，错开构建时间。
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       force_build:
