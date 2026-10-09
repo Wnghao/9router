@@ -63,18 +63,41 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 防御 set -u：正常这两个值来自 workflow env / step env，
+          # 缺省兜底避免"变量未定义"把整个任务打断。
+          UPSTREAM_REPO="${UPSTREAM_REPO:-decolua/9router}"
+          FORCE_BUILD="${FORCE_BUILD:-false}"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # ---------- 同步上游（容错）----------
+          # 上游被删除 / 转为私有 / 网络异常时，fetch 会失败。
+          # 这里刻意不让它把整个任务判为失败：
+          #   * 否则每小时一次的定时任务会变成每小时一封失败告警邮件；
+          #   * 而且后面"打 tag / 决定是否构建"的逻辑就跑不到了，
+          #     会连带失去"上游没了也能用 force_build 从冻结的 fork 重建镜像"的能力。
+          UPSTREAM_OK=true
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
-          git fetch --force upstream master --tags
+          if ! git fetch --force upstream master --tags; then
+            UPSTREAM_OK=false
+            echo "::warning title=上游仓库不可用::无法从 ${UPSTREAM_REPO} 拉取（可能已被删除、转为私有，或网络异常）。本次跳过同步，继续使用当前 master。"
+            {
+              echo "### ⚠️ 上游仓库不可用"
+              echo ""
+              echo "\`${UPSTREAM_REPO}\` 拉取失败（可能已被删除、转为私有，或网络异常）。"
+              echo "本次跳过同步，继续使用当前 fork master。服务与镜像不受影响。"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-          if git merge-base --is-ancestor upstream/master HEAD; then
-            echo "上游 master 没有新提交"
-          else
-            git merge --ff-only upstream/master
-            git push origin master
-            echo "已快进同步上游 master"
+          if [ "${UPSTREAM_OK}" = "true" ]; then
+            if git merge-base --is-ancestor upstream/master HEAD; then
+              echo "上游 master 没有新提交"
+            else
+              git merge --ff-only upstream/master
+              git push origin master
+              echo "已快进同步上游 master"
+            fi
           fi
 
           VERSION="$(node -p "require('./package.json').version")"
