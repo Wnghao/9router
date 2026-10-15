@@ -1,0 +1,234 @@
+name: Sync upstream and publish
+
+# 跟随官方 decolua/9router 自动更新，全程不占用 103/PVE 的资源：
+#   1) 定时把官方 master 快进同步到本 fork
+#   2) 发现官方 version 变化就自动打 vX.Y.Z tag
+#   3) 构建 linux/amd64 镜像，同时推 GHCR 和 Docker Hub
+#
+# 103 上的 1Panel「定时更新容器」任务靠 Docker Hub 国内加速拉取，无需任何改动。
+#
+# 刻意做成独立文件：上游 docker-publish.yml 里的 Docker Hub 推送被
+# `REPOSITORY === "decolua/9router"` 硬编码卡死，且 DOCKERHUB_IMAGE 写死在
+# 第 27 行。改那个文件的话，每次同步上游 master 都会冲突；新开文件上游没有，
+# 永远不会冲突。
+
+on:
+  schedule:
+    # 每小时整点（UTC）检查一次官方 master。
+    # 只是"检查"：没有新提交就几秒结束，不会重复构建。
+    # 103 侧的 1Panel 任务在每小时第 30 分拉取，错开构建时间。
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "上游没有新提交时也强制重新构建一次"
+        required: false
+        default: false
+        type: boolean
+
+# 串行化，避免两次构建并发时把 latest 推回旧版本
+concurrency:
+  group: sync-upstream-and-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  UPSTREAM_REPO: decolua/9router
+  DOCKERHUB_IMAGE: luckly888/9router
+
+jobs:
+  sync:
+    name: Sync upstream master
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.sync.outputs.version }}
+      tag: ${{ steps.sync.outputs.tag }}
+      build: ${{ steps.sync.outputs.build }}
+    steps:
+      - name: Check out fork master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream and tag release
+        id: sync
+        env:
+          FORCE_BUILD: ${{ inputs.force_build && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          # 防御 set -u：正常这两个值来自 workflow env / step env，
+          # 缺省兜底避免"变量未定义"把整个任务打断。
+          UPSTREAM_REPO="${UPSTREAM_REPO:-decolua/9router}"
+          FORCE_BUILD="${FORCE_BUILD:-false}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # ---------- 同步上游（容错）----------
+          # 上游被删除 / 转为私有 / 网络异常时，fetch 会失败。
+          # 这里刻意不让它把整个任务判为失败：
+          #   * 否则每小时一次的定时任务会变成每小时一封失败告警邮件；
+          #   * 而且后面"打 tag / 决定是否构建"的逻辑就跑不到了，
+          #     会连带失去"上游没了也能用 force_build 从冻结的 fork 重建镜像"的能力。
+          UPSTREAM_OK=true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          if ! git fetch --force upstream master --tags; then
+            UPSTREAM_OK=false
+            echo "::warning title=上游仓库不可用::无法从 ${UPSTREAM_REPO} 拉取（可能已被删除、转为私有，或网络异常）。本次跳过同步，继续使用当前 master。"
+            {
+              echo "### ⚠️ 上游仓库不可用"
+              echo ""
+              echo "\`${UPSTREAM_REPO}\` 拉取失败（可能已被删除、转为私有，或网络异常）。"
+              echo "本次跳过同步，继续使用当前 fork master。服务与镜像不受影响。"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "${UPSTREAM_OK}" = "true" ]; then
+            if git merge-base --is-ancestor upstream/master HEAD; then
+              echo "上游 master 没有新提交"
+            elif git merge --ff-only upstream/master 2>/dev/null; then
+              git push origin master
+              echo "已快进同步上游 master"
+            else
+              # fork master 上压着定制 commit（如 qoder 配额修复），上游又发了新版，
+              # 此时 ff 不可能成功。用 rebase 把定制 commit 接到新上游之后，
+              # 这样镜像既跟上官方新版、又保留本地改动。
+              # push 用 --force：这个仓库只有本 workflow 和我们自己动 master，
+              # 不存在覆盖他人提交的风险；失败时 rebase 冲突会让 job 报错，需人工介入。
+              echo "::notice title=非快进同步::fork 含定制 commit，改用 rebase 跟随上游"
+              git rebase upstream/master
+              git push --force origin master
+              echo "已 rebase 到最新上游并强推"
+              {
+                echo "### ⚠️ 非快进同步（已 rebase）"
+                echo ""
+                echo "fork master 上的定制 commit 已 rebase 到最新上游之上，镜像会同时带上官方新版和本地改动。"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          BUILD=false
+          NEED_TAG=false
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            # 本地已有同名 tag：多半是 `git fetch --tags` 从上游拉过来的（官方自己
+            # 也打 vX.Y.Z）。它指向的是官方原始 commit，没有我们的定制改动，
+            # 必须改指到 fork HEAD，否则构建出来的镜像会丢掉本地 patch。
+            echo "本地已存在 tag ${TAG}（来自上游或上一轮），将改指到 fork HEAD"
+            NEED_TAG=true
+          elif git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
+            echo "fork 上已存在 tag ${TAG}"
+            if [ "${FORCE_BUILD}" = "true" ]; then
+              NEED_TAG=true
+              echo "force_build=true，仍然构建"
+            fi
+          else
+            NEED_TAG=true
+          fi
+
+          if [ "${NEED_TAG}" = "true" ]; then
+            git tag -f -a "${TAG}" -m "${TAG}"
+            git push --force origin "refs/tags/${TAG}"
+            echo "已创建/更新并推送 tag ${TAG} -> $(git rev-parse --short HEAD)"
+            BUILD=true
+          fi
+
+          echo "build=${BUILD}" >> "$GITHUB_OUTPUT"
+          echo "本次是否构建: ${BUILD}"
+
+  build:
+    name: Build and push images
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Resolve lowercase GHCR image name
+        id: names
+        run: |
+          set -euo pipefail
+          GHCR_IMAGE="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "ghcr=${GHCR_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "ghcr image: ${GHCR_IMAGE}"
+
+      - name: Compute image tags
+        id: tags
+        env:
+          VERSION: ${{ needs.sync.outputs.version }}
+          GHCR_IMAGE: ${{ steps.names.outputs.ghcr }}
+        run: |
+          set -euo pipefail
+          TAGS="${GHCR_IMAGE}:${VERSION}
+          ${DOCKERHUB_IMAGE}:${VERSION}"
+          # 预发布版本不动 latest，避免把 latest 推回旧版本
+          if [[ "${VERSION}" != *-* ]]; then
+            TAGS="${TAGS}
+          ${GHCR_IMAGE}:latest
+          ${DOCKERHUB_IMAGE}:latest"
+          fi
+          {
+            echo "list<<EOF"
+            printf '%s\n' "${TAGS}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          printf '本次推送的 tag:\n%s\n' "${TAGS}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push linux/amd64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: |
+            APP_VERSION=${{ needs.sync.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        env:
+          VERSION: ${{ needs.sync.outputs.version }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          GHCR_IMAGE: ${{ steps.names.outputs.ghcr }}
+        run: |
+          {
+            echo "### 构建完成"
+            echo ""
+            echo "- 版本: \`${TAG}\`"
+            echo "- GHCR: \`${GHCR_IMAGE}:${VERSION}\`"
+            echo "- Docker Hub: \`${DOCKERHUB_IMAGE}:${VERSION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
